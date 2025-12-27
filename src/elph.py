@@ -5,6 +5,7 @@ This module provides functionality for calculating electron-phonon coupling
 using PySCF for periodic systems.
 """
 
+import sys, os
 from dataclasses import dataclass
 
 import numpy
@@ -244,13 +245,14 @@ def calculate_electron_phonon_coupling(
     """
     log = logger.new_logger(mf_k, verbose)
 
+    pcell = mf_k.cell.copy()
+    pcell.verbose = 10
+
     kpts_q = mf_q.kpts
     kpts_k = mf_k.kpts
     nq = len(kpts_q)
     nk = len(kpts_k)
-
-    pcell = mf_k.cell.copy()
-    pcell.verbose = 10
+    k_plus_q = get_k_plus_q(pcell, kpts_k, kpts_q)
 
     natm = pcell.natm
     nx = natm * 3
@@ -285,8 +287,6 @@ def calculate_electron_phonon_coupling(
     coeff_band_k = numpy.array(mf_k.mo_coeff).reshape(nk, nao, -1)
     num_band = coeff_band_k.shape[-1]
 
-    # q_plus_k = get_kconserv2(pcell, kpts_k, kpts_q)
-    k_plus_q = get_k_plus_q(pcell, kpts_k, kpts_q)
     g_qk_lmn = []
     for q in range(nq):
         cq = coeff_mode_q[q]
@@ -362,36 +362,22 @@ if __name__ == "__main__":
     qc = cell.make_kpts(qc_mesh)
     nqc = len(qc)
 
+    xc = "PBE,PBE"
     mf_qc = pbc.dft.KRKS(cell, qc)
-    mf_qc.xc = "LDA"
+    mf_qc.xc = xc
     mf_qc.conv_tol = 1e-6
     mf_qc.conv_tol_grad = 1e-4
     mf_qc.verbose = 4
     mf_qc.kernel()
 
-    kc_mesh = qc_mesh
+    kc_mesh = [6, 6, 6]
     kc = cell.make_kpts(kc_mesh)
     nkc = len(kc)
 
     mf_kc = pbc.dft.KRKS(cell, kc)
-    mf_kc.xc = "LDA"
+    mf_kc.xc = xc
     mf_kc.conv_tol = 1e-6
     mf_kc.conv_tol_grad = 1e-4
     mf_kc.verbose = 4
     mf_kc.kernel()
     info = calculate_electron_phonon_coupling(mf_kc, mf_qc, disp=1e-4)
-
-    import sys, os
-
-    sys.path.append("../../gwpt-main/")
-    from gwpt.eph.tools import vmat0_to_vmatq_new
-    from gwpt.pbc.eph_fd import kernel
-
-    vmat, omega, vec = kernel(mf_kc, disp=1e-4)
-    g_qk_lmn_ref = vmat0_to_vmatq_new(
-        vmat, vec, cell, kc, coeff_k=info.coeff_band_k
-    )
-    g_qk_lmn_sol = info.g_qk_lmn
-
-    err = abs(g_qk_lmn_sol - g_qk_lmn_ref).max()
-    print(f"Error: {err:.6e}")

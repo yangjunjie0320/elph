@@ -1,4 +1,4 @@
-import numpy as np
+import numpy
 import scipy.linalg
 
 from pyscf import lib
@@ -25,22 +25,24 @@ def get_k_plus_q(pcell, kpts_k, kpts_q=None):
 
     nk = len(kpts_k)
     nq = len(kpts_q)
-    a = pcell.lattice_vectors()
-    table = np.full((nk, nq), np.nan, dtype=float)
+    assert nk >= nq
+
+    lv = pcell.lattice_vectors()
+    table = numpy.full((nk, nq), numpy.nan, dtype=float)
 
     k_plus_q = kpts_k[:, None, :] + kpts_q[None, :, :]
     assert k_plus_q.shape == (nk, nq, 3)
 
     for k, vk in enumerate(kpts_k):
-        d = k_plus_q - vk
-        a_dot_d = lib.einsum("wx,abx->wab", a, d)
-        a_dot_d /= 2 * np.pi
+        lv_dot_dk = lib.einsum("wx,abx->wab", lv, k_plus_q - vk)
+        lv_dot_dk = lv_dot_dk / 2 / numpy.pi
 
-        m = np.sum(abs(a_dot_d - np.rint(a_dot_d)), axis=0) < 1e-9
-        table[k, m] = k
+        d = abs(lv_dot_dk - numpy.rint(lv_dot_dk))
+        m = numpy.sum(d, axis=0) < 1e-9
+        table[m] = k
 
     message = "kpts_k and kpts_q are not compatible"
-    assert not np.isnan(table).any(), message
+    assert not numpy.isnan(table).any(), message
 
     return table.astype(int)
 
@@ -48,7 +50,7 @@ def get_k_plus_q(pcell, kpts_k, kpts_q=None):
 def eigh_hess(hess_q, mass, freq_cutoff=100, keep_imag_freq=False, verbose=4):
     log = lib.logger.Logger(verbose)
 
-    sqrt_mm = np.sqrt(mass[:, None] * mass[None, :])
+    sqrt_mm = numpy.sqrt(mass[:, None] * mass[None, :])
     nx = hess_q[0].shape[1] * hess_q[0].shape[2]
     freq_q = []
     coeff_q = []
@@ -65,7 +67,7 @@ def eigh_hess(hess_q, mass, freq_cutoff=100, keep_imag_freq=False, verbose=4):
         mask = eigval > 0
 
         # Convert eigenvalues to frequencies
-        freq_real_au = np.sqrt(eigval[mask])
+        freq_real_au = numpy.sqrt(eigval[mask])
         freq_real_wn = freq_real_au * HARTREE2WAVENUMBER
 
         fq = freq_real_au
@@ -82,7 +84,7 @@ def eigh_hess(hess_q, mass, freq_cutoff=100, keep_imag_freq=False, verbose=4):
         fq = fq[mask]
         cq = cq[:, mask]
 
-        sqrt_mf = np.sqrt(2 * mass[:, None] * fq)
+        sqrt_mf = numpy.sqrt(2 * mass[:, None] * fq)
         cq = cq / sqrt_mf[:, None, :]
 
         freq_q.append(fq)
@@ -101,7 +103,7 @@ def dg_g2k(dg, pcell=None, kpts_k=None, kpts_q=None):
     dg = dg.reshape(nx, nq, nx)
     hess_q = lib.einsum("Rq,xRy->qxy", phase, dg)
     hess_q = hess_q.reshape(nq, natm, 3, natm, 3)
-    return hess_q * np.sqrt(nq)
+    return hess_q * numpy.sqrt(nq)
 
 
 def dv_g2k(dv, pcell=None, kpts_k=None, kpts_q=None):
@@ -120,9 +122,46 @@ def dv_g2k(dv, pcell=None, kpts_k=None, kpts_q=None):
     assert dv.shape == (nx, nq, nao, nq, nao)
     g_qk_xmn = []
     for q, vq in enumerate(kpts_q):
-        f1 = np.exp(1j * np.dot(dqtv, (kpts_k + vq).T))
-        f2 = np.exp(1j * np.dot(dqtv, kpts_k.T))
+        f1 = numpy.exp(1j * numpy.dot(dqtv, (kpts_k + vq).T))
+        f2 = numpy.exp(1j * numpy.dot(dqtv, kpts_k.T))
         g_qk_xmn.append(lib.einsum("xRmSn,Rk,Sk->kxmn", dv, f1.conj(), f2))
 
-    g_qk_xmn = np.array(g_qk_xmn).reshape(nq, nk, nx, nao, nao)
+    g_qk_xmn = numpy.array(g_qk_xmn).reshape(nq, nk, nx, nao, nao)
     return g_qk_xmn
+
+
+if __name__ == "__main__":
+    from pyscf import pbc
+
+    cell = pbc.gto.Cell()
+    cell.atom = """
+    C  0.000000000000   0.000000000000   0.000000000000
+    C  1.685068664391   1.685068664391   1.685068664391
+    """
+    cell.basis = "gth-szv"
+    cell.pseudo = "gth-pade"
+    cell.a = """
+    0.000000000, 3.370137329, 3.370137329
+    3.370137329, 0.000000000, 3.370137329
+    3.370137329, 3.370137329, 0.000000000
+    """
+    cell.unit = "B"
+    cell.verbose = 4
+    cell.build()
+
+    lv = cell.lattice_vectors()
+    kpts_k = cell.make_kpts([6, 6, 6])
+    kpts_q = cell.make_kpts([3, 3, 3])
+    k_plus_q = get_k_plus_q(cell, kpts_k, kpts_q)
+
+    for q, vq in enumerate(kpts_q):
+        for k1, vk1 in enumerate(kpts_k):
+            k2 = k_plus_q[k1, q]
+            vk2 = kpts_k[k2]
+
+            dk = vk1 + vq - vk2
+            lv_dot_dk = lib.einsum("wx,x->w", lv, dk)
+            lv_dot_dk = lv_dot_dk / 2 / numpy.pi
+
+            err = abs(lv_dot_dk - numpy.rint(lv_dot_dk)).max()
+            assert err < 1e-9, f"Error: {err:.6e}"
