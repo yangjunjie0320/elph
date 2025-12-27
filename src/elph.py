@@ -27,8 +27,6 @@ from tools import eigh_hess, dg_g2k, dv_g2k, get_kconserv2
 
 @dataclass
 class ElectronPhononCouplingInfo:
-    """Data class to store electron-phonon coupling information."""
-
     mf_qc: pbc.dft.KRKS = None
     mf_kc: pbc.dft.KRKS = None
     pcell: pbc.gto.Cell = None
@@ -39,12 +37,14 @@ class ElectronPhononCouplingInfo:
     mesh_q: numpy.ndarray = None
     mesh_k: numpy.ndarray = None
 
-    dv_g: numpy.ndarray = None
-    dg_g: numpy.ndarray = None
+    dv: numpy.ndarray = None
+    dg: numpy.ndarray = None
 
     hess_q: numpy.ndarray = None
     freq_mode_q: numpy.ndarray = None
     coeff_mode_q: numpy.ndarray = None
+
+    ene_band_k: numpy.ndarray = None
     coeff_band_k: numpy.ndarray = None
     num_mode: int = None
     num_band: int = None
@@ -301,10 +301,16 @@ def calculate_electron_phonon_coupling(
 
     # Create and return ElectronPhononCouplingInfo object
     info = ElectronPhononCouplingInfo()
+    info.mf_kc = mf_kc
+    info.mf_qc = mf_qc
+    info.pcell = pcell
+
     info.hess_q = hess_q
     info.freq_mode_q = freq_mode_q
     info.coeff_mode_q = coeff_mode_q
-    info.coeff_band_k = coeff_band_k
+    info.ene_band_k = mf_kc.mo_energy
+    info.coeff_band_k = mf_kc.mo_coeff
+
     info.num_mode = num_mode
     info.num_band = num_band
     info.g_qk_xmn = g_qk_xmn
@@ -316,6 +322,10 @@ def calculate_electron_phonon_coupling(
     info.mesh_k = mesh_k
     info.dv = dv
     info.dg = dg
+
+    for k, v in info.__dict__.items():
+        assert v is not None
+
     return info
 
 
@@ -381,18 +391,7 @@ if __name__ == "__main__":
     kmf.verbose = 4
     kmf.kernel()
 
-    # info = gamma2k(mf, kmf, dv, dg)
-    h5 = "dvdg.h5"
-    if os.path.exists(h5):
-        with h5py.File(h5, "r") as f:
-            dv = f["dv"][:]
-            dg = f["dg"][:]
-    else:
-        dv, dg = calculate_dv_dg(mf, disp=1e-4)
-        with h5py.File(h5, "w") as f:
-            f.create_dataset("dv", data=dv)
-            f.create_dataset("dg", data=dg)
-
+    dv, dg = calculate_dv_dg(mf, disp=1e-4)
     info = calculate_electron_phonon_coupling(mf, kmf, dv, dg)
 
     sys.path.append("../../gwpt-main/")
