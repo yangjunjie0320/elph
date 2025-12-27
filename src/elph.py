@@ -6,54 +6,55 @@ using PySCF for periodic systems.
 """
 
 from dataclasses import dataclass
-from typing import Optional
-import os
-import sys
 
 import numpy
 
-from pyscf import pbc, lib
+from pyscf import lib, pbc
+from pyscf.data.nist import MP_ME
 from pyscf.lib import logger
 from pyscf.pbc import tools
-from pyscf.pbc.tools.k2gamma import k2gamma
 from pyscf.pbc.df import FFTDF
-from pyscf.pbc.dft.numint import NumInt
-from pyscf.pbc.tools.k2gamma import kpts_to_kmesh
 from pyscf.pbc.dft.multigrid import MultiGridNumInt2
-from pyscf.data.nist import MP_ME
+from pyscf.pbc.dft.numint import NumInt
+from pyscf.pbc.tools.k2gamma import k2gamma, kpts_to_kmesh
 
-from tools import eigh_hess, dg_g2k, dv_g2k, get_kconserv2
+from tools import dg_g2k, dv_g2k, eigh_hess, get_k_plus_q
 
 
 @dataclass
 class ElectronPhononCouplingInfo:
-    mf_qc: pbc.dft.KRKS = None
-    mf_kc: pbc.dft.KRKS = None
-    pcell: pbc.gto.Cell = None
+    # Input objects
+    mf_qc: pbc.dft.KRKS
+    mf_kc: pbc.dft.KRKS
+    pcell: pbc.gto.Cell
 
-    kpts_q: numpy.ndarray = None
-    kpts_k: numpy.ndarray = None
+    # k-point mesh information
+    kpts_q: numpy.ndarray
+    kpts_k: numpy.ndarray
+    mesh_q: numpy.ndarray
+    mesh_k: numpy.ndarray
 
-    mesh_q: numpy.ndarray = None
-    mesh_k: numpy.ndarray = None
+    # Phonon information
+    hess_q: numpy.ndarray
+    freq_mode_q: numpy.ndarray
+    coeff_mode_q: numpy.ndarray
+    num_mode: int
 
-    dv: numpy.ndarray = None
-    dg: numpy.ndarray = None
+    # Electronic information
+    ene_band_k: numpy.ndarray
+    coeff_band_k: numpy.ndarray
+    num_band: int
 
-    hess_q: numpy.ndarray = None
-    freq_mode_q: numpy.ndarray = None
-    coeff_mode_q: numpy.ndarray = None
+    # Electron-phonon coupling matrices
+    g_qk_xmn: numpy.ndarray
+    g_qk_lmn: numpy.ndarray
 
-    ene_band_k: numpy.ndarray = None
-    coeff_band_k: numpy.ndarray = None
-    num_mode: int = None
-    num_band: int = None
-
-    g_qk_xmn: numpy.ndarray = None
-    g_qk_lmn: numpy.ndarray = None
+    # Derivative information
+    dv: numpy.ndarray
+    dg: numpy.ndarray
 
 
-def calculate_dv_dg(kmf, disp=1e-4, disp_full_supercell=False, verbose=4):
+def fd_eph(kmf, disp=1e-4, disp_full_supercell=False, verbose=4):
     log = logger.new_logger(kmf, verbose)
 
     assert isinstance(kmf, pbc.dft.rks.KohnShamDFT)
@@ -211,82 +212,88 @@ def calculate_dv_dg(kmf, disp=1e-4, disp_full_supercell=False, verbose=4):
 
 
 def calculate_electron_phonon_coupling(
-    mf_kc=None, mf_qc=None, dv=None, dg=None, disp=1e-4
+    mf_k=None,
+    mf_q=None,
+    disp=1e-4,
+    verbose=4,
+    freq_cutoff=100.0,
+    keep_imag_freq=False,
 ):
     """
     Calculate electron-phonon coupling matrix elements.
 
     Parameters
     ----------
-    mf_kc : pbc.dft.KRKS, optional
-        Mean-field object for k-point mesh kc
-    mf_qc : pbc.dft.KRKS, optional
-        Mean-field object for q-point mesh qc
+    mf_k : pbc.dft.KRKS
+        Mean-field object for k-point mesh
+    mf_q : pbc.dft.KRKS
+        Mean-field object for q-point mesh
     disp : float, optional
         Displacement magnitude, by default 1e-4
+    verbose : int, optional
+        Verbosity level, by default 4
+    freq_cutoff : float, optional
+        Frequency cutoff in cm^-1, by default 100.0
+    keep_imag_freq : bool, optional
+        Whether to keep imaginary frequencies, by default False
 
     Returns
     -------
     info : ElectronPhononCouplingInfo
         Electron-phonon coupling information object containing all results
     """
-    kpt_q = mf_qc.kpts
-    kpt_k = mf_kc.kpts
-    nq = len(kpt_q)
-    nk = len(kpt_k)
+    log = logger.new_logger(mf_k, verbose)
 
-    pcell = mf_kc.cell.copy()
+    kpts_q = mf_q.kpts
+    kpts_k = mf_k.kpts
+    nq = len(kpts_q)
+    nk = len(kpts_k)
+
+    pcell = mf_k.cell.copy()
     pcell.verbose = 10
 
     natm = pcell.natm
     nx = natm * 3
     nao = pcell.nao_nr()
 
-    assert mf_qc.converged
-    assert mf_kc.converged
+    assert mf_q.converged
+    assert mf_k.converged
 
-    if dv is None or dg is None:
-        dv, dg = calculate_dv_dg(mf_qc, disp=disp)
-
+    dv, dg = fd_eph(mf_q, disp=disp)
     dv = dv.reshape(natm * 3, nq, nao, nq, nao)
     dg = dg.reshape(natm * 3, natm * nq * 3)
 
-    mass = pcell.atom_mass_list() * MP_ME
-    sqrt_mm = numpy.sqrt(mass[:, None] * mass[None, :])
-
-    hess_q = dg_g2k(dg, pcell=pcell, qc=qc, kc=kc)
-    g_qk_xmn = dv_g2k(dv, pcell=pcell, qc=qc, kc=kc)
+    hess_q = dg_g2k(dg, pcell=pcell, kpts_q=kpts_q, kpts_k=kpts_k)
+    g_qk_xmn = dv_g2k(dv, pcell=pcell, kpts_q=kpts_q, kpts_k=kpts_k)
 
     hess_q = hess_q.reshape(nq, natm, 3, natm, 3)
-    print(f"hess_q shape = {hess_q.shape}")
-    print(f"g_qk_xmn shape = {g_qk_xmn.shape}")
     g_qk_xmn = g_qk_xmn.reshape(nq, nk, nx, nao, nao)
 
-    res = eigh_hess(hess_q / sqrt_mm[None, :, None, :, None])
-    freq_mode_q = []
-    coeff_mode_q = []
-    for fq, cq in zip(res[0], res[1], strict=True):
-        sqrt_mf = numpy.sqrt(2 * mass[:, None] * fq)
-        sqrt_mf = sqrt_mf.reshape(natm, -1)
-        cq = cq.reshape(natm, 3, -1)
+    freq_mode_q, coeff_mode_q = eigh_hess(
+        hess_q,
+        mass=pcell.atom_mass_list() * MP_ME,
+        freq_cutoff=freq_cutoff,
+        keep_imag_freq=keep_imag_freq,
+        verbose=verbose,
+    )
 
-        freq_mode_q.append(fq)
-        coeff_mode_q.append(cq / sqrt_mf[:, None, :])
     freq_mode_q = numpy.array(freq_mode_q).reshape(nq, -1)
     coeff_mode_q = numpy.array(coeff_mode_q).reshape(nq, nx, -1)
     num_mode = coeff_mode_q.shape[-1]
 
-    coeff_band_k = numpy.array(mf_kc.mo_coeff).reshape(nk, nao, -1)
+    ene_band_k = numpy.array(mf_k.mo_energy).reshape(nk, -1)
+    coeff_band_k = numpy.array(mf_k.mo_coeff).reshape(nk, nao, -1)
     num_band = coeff_band_k.shape[-1]
 
-    q_plus_k = get_kconserv2(pcell, kpt_k, kpt_q)
+    # q_plus_k = get_kconserv2(pcell, kpts_k, kpts_q)
+    k_plus_q = get_k_plus_q(pcell, kpts_k, kpts_q)
     g_qk_lmn = []
     for q in range(nq):
         cq = coeff_mode_q[q]
         fq = freq_mode_q[q]
         for k1 in range(nk):
             ck1 = coeff_band_k[k1]
-            k2 = q_plus_k[k1, q]
+            k2 = k_plus_q[k1, q]
             ck2 = coeff_band_k[k2]
 
             scripts = "xmn,xl,mp,nq->lpq"
@@ -294,38 +301,38 @@ def calculate_electron_phonon_coupling(
             g_qk_lmn.append(lib.einsum(scripts, *operand))
 
     g_qk_lmn = numpy.array(g_qk_lmn)
-    g_qk_lmn_sol = g_qk_lmn.reshape(nq, nk, num_mode, num_band, num_band)
+    g_qk_lmn = g_qk_lmn.reshape(nq, nk, num_mode, num_band, num_band)
 
-    mesh_q = kpts_to_kmesh(pcell, qc)
-    mesh_k = kpts_to_kmesh(pcell, kc)
+    mesh_q = kpts_to_kmesh(pcell, kpts_q)
+    mesh_k = kpts_to_kmesh(pcell, kpts_k)
 
     # Create and return ElectronPhononCouplingInfo object
-    info = ElectronPhononCouplingInfo()
-    info.mf_kc = mf_kc
-    info.mf_qc = mf_qc
-    info.pcell = pcell
-
-    info.hess_q = hess_q
-    info.freq_mode_q = freq_mode_q
-    info.coeff_mode_q = coeff_mode_q
-    info.ene_band_k = mf_kc.mo_energy
-    info.coeff_band_k = mf_kc.mo_coeff
-
-    info.num_mode = num_mode
-    info.num_band = num_band
-    info.g_qk_xmn = g_qk_xmn
-    info.g_qk_lmn = g_qk_lmn_sol
-
-    info.kpts_q = kpt_q
-    info.kpts_k = kpt_k
-    info.mesh_q = mesh_q
-    info.mesh_k = mesh_k
-    info.dv = dv
-    info.dg = dg
-
-    for k, v in info.__dict__.items():
-        assert v is not None
-
+    info = ElectronPhononCouplingInfo(
+        # Input objects
+        mf_qc=mf_q,
+        mf_kc=mf_k,
+        pcell=pcell,
+        # k-point mesh information
+        kpts_q=kpts_q,
+        kpts_k=kpts_k,
+        mesh_q=mesh_q,
+        mesh_k=mesh_k,
+        # Phonon information
+        hess_q=hess_q,
+        freq_mode_q=freq_mode_q,
+        coeff_mode_q=coeff_mode_q,
+        num_mode=num_mode,
+        # Electronic information
+        ene_band_k=ene_band_k,
+        coeff_band_k=coeff_band_k,
+        num_band=num_band,
+        # Electron-phonon coupling matrices
+        g_qk_xmn=g_qk_xmn,
+        g_qk_lmn=g_qk_lmn,
+        # Derivative information
+        dv=dv,
+        dg=dg,
+    )
     return info
 
 
@@ -355,62 +362,36 @@ if __name__ == "__main__":
     qc = cell.make_kpts(qc_mesh)
     nqc = len(qc)
 
-    mf = pbc.dft.KRKS(cell, qc)
-    mf.xc = "LDA"
-    mf.conv_tol = 1e-6
-    mf.conv_tol_grad = 1e-4
-    mf.verbose = 4
-    mf.kernel()
-
-    dvdg_file = "dvdg.h5"
-
-    import h5py
-
-    if os.path.exists(dvdg_file):
-        with h5py.File(dvdg_file, "r") as f:
-            dv = f["dv"][:]
-            dg = f["dg"][:]
-    else:
-        dv, dg = calculate_dv_dg(mf, disp=1e-4)
-        with h5py.File(dvdg_file, "w") as f:
-            f.create_dataset("dv", data=dv)
-            f.create_dataset("dg", data=dg)
-
-    assert dv.shape == (natm * 3, nao * nqc, nao * nqc)
-    assert dg.shape == (natm * 3, natm * nqc * 3)
+    mf_qc = pbc.dft.KRKS(cell, qc)
+    mf_qc.xc = "LDA"
+    mf_qc.conv_tol = 1e-6
+    mf_qc.conv_tol_grad = 1e-4
+    mf_qc.verbose = 4
+    mf_qc.kernel()
 
     kc_mesh = qc_mesh
     kc = cell.make_kpts(kc_mesh)
     nkc = len(kc)
-    # any kc + qc should be in kc
 
-    kmf = pbc.dft.KRKS(cell, kc)
-    kmf.xc = "LDA"
-    kmf.conv_tol = 1e-6
-    kmf.conv_tol_grad = 1e-4
-    kmf.verbose = 4
-    kmf.kernel()
+    mf_kc = pbc.dft.KRKS(cell, kc)
+    mf_kc.xc = "LDA"
+    mf_kc.conv_tol = 1e-6
+    mf_kc.conv_tol_grad = 1e-4
+    mf_kc.verbose = 4
+    mf_kc.kernel()
+    info = calculate_electron_phonon_coupling(mf_kc, mf_qc, disp=1e-4)
 
-    dv, dg = calculate_dv_dg(mf, disp=1e-4)
-    info = calculate_electron_phonon_coupling(mf, kmf, dv, dg)
+    import sys, os
 
     sys.path.append("../../gwpt-main/")
-    from gwpt.tools.gamma2k import vmat0_to_vmatq_new  # type: ignore
+    from gwpt.eph.tools import vmat0_to_vmatq_new
+    from gwpt.pbc.eph_fd import kernel
 
-    natm = cell.natm
-    nao = cell.nao_nr()
-    nq = len(qc)
-    dv = dv.reshape(natm * 3, nq, nao, nq, nao)
-    res = vmat0_to_vmatq_new(
-        dv, info.coeff_mode_q, cell, qc, coeff_k=info.coeff_band_k
+    vmat, omega, vec = kernel(mf_kc, disp=1e-4)
+    g_qk_lmn_ref = vmat0_to_vmatq_new(
+        vmat, vec, cell, kc, coeff_k=info.coeff_band_k
     )
-    g_qk_lmn_ref, g_qk_xmn_ref = res
-    g_qk_lmn_ref = numpy.array(g_qk_lmn_ref)
+    g_qk_lmn_sol = info.g_qk_lmn
 
-    err = abs(g_qk_lmn_ref - info.g_qk_lmn).max()
-    print(f"g_qk_lmn error = {err:6.2e}")
-
-    err = abs(g_qk_xmn_ref - info.g_qk_xmn).max()
-    print(f"g_qk_xmn error = {err:6.2e}")
-
-    assert 1 == 2
+    err = abs(g_qk_lmn_sol - g_qk_lmn_ref).max()
+    print(f"Error: {err:.6e}")
